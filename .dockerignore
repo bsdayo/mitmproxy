@@ -1,0 +1,6 @@
+*
+!main.py
+!addons/
+!addons/**
+**/__pycache__/
+**/*.py[cod]
