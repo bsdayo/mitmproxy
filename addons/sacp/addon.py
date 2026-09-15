@@ -15,6 +15,7 @@ class Sacp:
     def __init__(self):
         self.access_token: str | None = None
         self.building_id: int | None = None
+        self._credentials_changed = asyncio.Event()
         self.task: asyncio.Task | None = None
         self._running = False
 
@@ -81,6 +82,7 @@ class Sacp:
             f"{HOST}:{port}",
         ):
             return
+        previous_credentials = self.access_token, self.building_id
         if "X-Access-Token" in request.headers:
             self.access_token = request.headers["X-Access-Token"]
             logger.info("Captured X-Access-Token")
@@ -94,6 +96,12 @@ class Sacp:
             else:
                 self.building_id = building_id
                 logger.info("Captured buildingId=%s", building_id)
+        if (
+            self.access_token is not None
+            and self.building_id is not None
+            and (self.access_token, self.building_id) != previous_credentials
+        ):
+            self._credentials_changed.set()
 
     async def run(self):
         async with httpx.AsyncClient(trust_env=False) as client:
@@ -123,6 +131,7 @@ class Sacp:
 
     async def publish_loop(self, client, mqtt):
         while True:
+            self._credentials_changed.clear()
             token, building_id = self.access_token, self.building_id
             if token is None or building_id is None:
                 logger.error("Waiting to capture X-Access-Token and buildingId")
@@ -147,4 +156,10 @@ class Sacp:
                     raise
                 except Exception as error:
                     logger.error("State update failed (%s)", type(error).__name__)
-            await asyncio.sleep(ctx.options.sacp_ha_interval)
+            try:
+                await asyncio.wait_for(
+                    self._credentials_changed.wait(),
+                    timeout=ctx.options.sacp_ha_interval,
+                )
+            except TimeoutError:
+                pass
