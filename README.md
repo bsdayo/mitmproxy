@@ -19,3 +19,6 @@
 | `sacp_ha_interval` | `3600`，更新间隔（秒） |
 | `sacp_ha_url` | HA 基础地址，例如 `http://homeassistant.local:8123`；留空关闭历史回填 |
 | `sacp_ha_token` | HA 管理员的长期访问令牌；为空时读取环境变量 `SACP_HA_TOKEN` |
+| `sacp_ha_electricity_price` | 电价（元/kWh），字符串；默认空，关闭电费回填 |
+| `sacp_ha_cold_water_price` | 冷水单价（元/m³），字符串；默认空，关闭冷水费用回填 |
+| `sacp_ha_hot_water_price` | 热水单价（元/m³），字符串；默认空，关闭热水费用回填 |

@@ -1,3 +1,5 @@
+"""Fetch room readings and describe their MQTT entities for Home Assistant."""
+
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,22 +65,27 @@ async def fetch(
 
     result = data["result"]
     meters = result["monitordataList"]
-    electricity = _meter(meters, 1)
-    cold_water = _meter(meters, 2)
-    hot_water = _meter(meters, 3)
     values: dict[str, int | float | str] = {
         "balance": result["totalBalance"],
-        "electricity_meter": electricity["dataItemValue"],
-        "cold_water_meter": cold_water["dataItemValue"],
-        "hot_water_meter": hot_water["dataItemValue"],
-        "monthly_electricity_meter": electricity["monthTotalValue"],
-        "monthly_electricity_cost": electricity["monthTotalMoney"],
-        "monthly_cold_water_meter": cold_water["monthTotalValue"],
-        "monthly_cold_water_cost": cold_water["monthTotalMoney"],
-        "monthly_hot_water_meter": hot_water["monthTotalValue"],
-        "monthly_hot_water_cost": hot_water["monthTotalMoney"],
         "monthly_total_cost": result["monthTotalBill"],
     }
+    readings: list[Reading] = []
+    for energy, kind in METER_KINDS.items():
+        meter = _meter(meters, energy)
+        values[f"{kind}_meter"] = meter["dataItemValue"]
+        values[f"monthly_{kind}_meter"] = meter["monthTotalValue"]
+        values[f"monthly_{kind}_cost"] = meter["monthTotalMoney"]
+
+        meter_id = meter["meterId"]
+        if type(meter_id) is not int or meter_id < 0:
+            raise ValueError("invalid meterId")
+        read_at = datetime.strptime(
+            meter["dataItemValueTime"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=TIMEZONE)
+        readings.append(
+            Reading(building_id, kind, meter_id, meter["dataItemValue"], read_at)
+        )
+
     for field, value in values.items():
         if (
             isinstance(value, bool)
@@ -86,19 +93,9 @@ async def fetch(
             or not math.isfinite(value)
         ):
             raise ValueError(f"upstream field {field} must be a finite number")
-    readings = []
-    for energy, kind in METER_KINDS.items():
-        meter = _meter(meters, energy)
-        meter_id = meter["meterId"]
-        if type(meter_id) is not int or meter_id < 0:
-            raise ValueError("invalid meterId")
-        read_at = datetime.strptime(
-            meter["dataItemValueTime"], "%Y-%m-%d %H:%M:%S"
-        ).replace(tzinfo=TIMEZONE)
-        values[f"{kind}_read_at"] = read_at.isoformat()
-        readings.append(
-            Reading(building_id, kind, meter_id, meter["dataItemValue"], read_at)
-        )
+    values.update(
+        {f"{reading.kind}_read_at": reading.read_at.isoformat() for reading in readings}
+    )
     return Snapshot(building_id, values, tuple(readings))
 
 

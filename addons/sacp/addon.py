@@ -1,14 +1,17 @@
+"""Capture credentials and coordinate upstream queries, MQTT, and HA history."""
+
 import asyncio
 import json
 import logging
 import os
+from decimal import Decimal
 
 import aiomqtt
 import httpx
 from mitmproxy import addonmanager, ctx, exceptions, http
 
-from .history import HistoryWriter, websocket_url
-from .stats import HOST, Snapshot, discovery, fetch
+from .history import HistoryWriter, parse_price, websocket_url
+from .stats import HOST, METER_KINDS, Snapshot, discovery, fetch
 
 logger = logging.getLogger(__name__)
 
@@ -17,17 +20,30 @@ def _ha_token() -> str:
     return ctx.options.sacp_ha_token or os.environ.get("SACP_HA_TOKEN", "")
 
 
+def _ha_prices() -> dict[str, Decimal]:
+    prices = {}
+    for kind in METER_KINDS.values():
+        option = f"sacp_ha_{kind}_price"
+        try:
+            price = parse_price(getattr(ctx.options, option))
+        except ValueError as error:
+            raise exceptions.OptionsError(f"{option}: {error}") from error
+        if price is not None:
+            prices[kind] = price
+    return prices
+
+
 class Sacp:
-    def __init__(self):
+    def __init__(self) -> None:
         self.access_token: str | None = None
         self.building_id: int | None = None
         self._credentials_changed = asyncio.Event()
         self._state_changed = asyncio.Event()
         self._snapshot: Snapshot | None = None
-        self.task: asyncio.Task | None = None
+        self.task: asyncio.Task[None] | None = None
         self._running = False
 
-    def load(self, loader: addonmanager.Loader):
+    def load(self, loader: addonmanager.Loader) -> None:
         for name, kind, default, help_text in (
             (
                 "mqtt_host",
@@ -57,8 +73,18 @@ class Sacp:
             ),
         ):
             loader.add_option(f"sacp_ha_{name}", kind, default, help_text)
+        for kind in METER_KINDS.values():
+            unit = "kWh" if kind == "electricity" else "m³"
+            loader.add_option(
+                f"sacp_ha_{kind}_price",
+                str,
+                "",
+                f"Fixed {kind} price in CNY/{unit}; omit to disable cost history. "
+                "Applies only to usage records written in the current batch.",
+            )
 
-    def configure(self, updated: set[str]):
+    def configure(self, updated: set[str]) -> None:
+        _ha_prices()
         if bool(ctx.options.sacp_ha_url) != bool(_ha_token()):
             raise exceptions.OptionsError(
                 "sacp_ha_url and sacp_ha_token (or SACP_HA_TOKEN) must be set together"
@@ -86,18 +112,18 @@ class Sacp:
             self.done()
             self.running()
 
-    def running(self):
+    def running(self) -> None:
         self._running = True
         if ctx.options.sacp_ha_mqtt_host or ctx.options.sacp_ha_url:
             self.task = asyncio.create_task(self.run())
 
-    def done(self):
+    def done(self) -> None:
         self._running = False
         if self.task:
             self.task.cancel()
             self.task = None
 
-    def requestheaders(self, flow: http.HTTPFlow):
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
         request = flow.request
         port = 443 if request.scheme == "https" else 80
         if (request.host_header or "").lower() not in (
@@ -126,9 +152,9 @@ class Sacp:
         ):
             self._credentials_changed.set()
 
-    async def run(self):
+    async def run(self) -> None:
         history = (
-            HistoryWriter(ctx.options.sacp_ha_url, _ha_token())
+            HistoryWriter(ctx.options.sacp_ha_url, _ha_token(), _ha_prices())
             if ctx.options.sacp_ha_url
             else None
         )
@@ -141,7 +167,7 @@ class Sacp:
                 if history:
                     tasks.create_task(history.run())
 
-    async def mqtt_loop(self):
+    async def mqtt_loop(self) -> None:
         while True:
             try:
                 async with aiomqtt.Client(
@@ -160,7 +186,7 @@ class Sacp:
                 logger.error("MQTT worker failed; retrying in 5 seconds")
             await asyncio.sleep(5)
 
-    async def watch_connection(self, mqtt: aiomqtt.Client):
+    async def watch_connection(self, mqtt: aiomqtt.Client) -> None:
         # Iterating also detects disconnection while the publisher is sleeping.
         async for _ in mqtt.messages:
             pass
@@ -168,7 +194,7 @@ class Sacp:
 
     async def query_loop(
         self, client: httpx.AsyncClient, history: HistoryWriter | None
-    ):
+    ) -> None:
         while True:
             self._credentials_changed.clear()
             token, building_id = self.access_token, self.building_id
@@ -196,7 +222,7 @@ class Sacp:
             except TimeoutError:
                 pass
 
-    async def publish_loop(self, mqtt: aiomqtt.Client):
+    async def publish_loop(self, mqtt: aiomqtt.Client) -> None:
         while True:
             self._state_changed.clear()
             snapshot = self._snapshot

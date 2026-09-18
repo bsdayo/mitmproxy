@@ -5,7 +5,7 @@ import json
 import logging
 import math
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from itertools import groupby
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -18,6 +18,39 @@ logger = logging.getLogger(__name__)
 RETRY_SECONDS = 30
 MAX_PENDING = 1024
 DAY_MS = 86_400_000
+
+
+def parse_price(value: str) -> Decimal | None:
+    if not value.strip():
+        return None
+    try:
+        price = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError("price must be a finite non-negative number") from error
+    if not price.is_finite() or price < 0:
+        raise ValueError("price must be a finite non-negative number")
+    return price
+
+
+def plan_cost_statistics(
+    usage: list[dict[str, Any]], price: Decimal
+) -> list[dict[str, Any]]:
+    """Convert the current usage batch to costs at a fixed price."""
+    result = []
+    for row in usage:
+        amount = float(Decimal(str(row["sum"])) * price)
+        if not math.isfinite(amount):
+            raise ValueError("calculated cost must be finite")
+        result.append(
+            {
+                "start": row["start"],
+                # Both fields are monetary amounts; never store meter readings
+                # in a statistic whose unit is CNY.
+                "state": amount,
+                "sum": amount,
+            }
+        )
+    return result
 
 
 def websocket_url(url: str) -> str:
@@ -49,10 +82,10 @@ def slot(reading: Reading) -> datetime:
 def plan_statistics(
     readings: list[Reading], existing: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Append daily deltas or correct the latest reading; never guess gap usage."""
+    """Require time-ordered readings; correct the latest row, exclude gap usage."""
     rows = {row["start"]: row for row in existing}
     result = []
-    for reading in sorted(readings, key=lambda item: item.read_at):
+    for reading in readings:
         start = slot(reading)
         timestamp = int(start.timestamp() * 1000)
         if rows and timestamp < max(rows):
@@ -61,10 +94,9 @@ def plan_statistics(
         current = rows.get(timestamp)
         if current is not None and current["state"] == reading.value:
             continue
-        previous_times = [time for time in rows if time < timestamp]
+        previous_time = max((time for time in rows if time < timestamp), default=None)
         total = 0
-        if previous_times:
-            previous_time = max(previous_times)
+        if previous_time is not None:
             previous = rows[previous_time]
             for key in ("state", "sum"):
                 value = previous.get(key)
@@ -99,11 +131,13 @@ def plan_statistics(
 
 
 class HAConnection:
-    def __init__(self, socket: ClientConnection):
+    """Sequential HA commands with confirmation that imported rows are stored."""
+
+    def __init__(self, socket: ClientConnection) -> None:
         self.socket = socket
         self.sequence = 0
 
-    async def authenticate(self, token: str):
+    async def authenticate(self, token: str) -> None:
         async with asyncio.timeout(30):
             if json.loads(await self.socket.recv()).get("type") != "auth_required":
                 raise ValueError("Unexpected HA authentication handshake")
@@ -128,75 +162,96 @@ class HAConnection:
         return response.get("result")
 
     async def statistics(
-        self, ids: list[str], **period: Any
+        self, statistic_ids: list[str], **period: Any
     ) -> dict[str, list[dict[str, Any]]]:
         return await self.command(
             "recorder/statistics_during_period",
-            statistic_ids=ids,
+            statistic_ids=statistic_ids,
             period="hour",
             types=["state", "sum"],
             units={"energy": "kWh", "volume": "m³"},
             **period,
         )
 
-    async def import_statistics(self, reading: Reading, rows: list[dict[str, Any]]):
-        electricity = reading.kind == "electricity"
+    async def import_statistics(
+        self, reading: Reading, rows: list[dict[str, Any]], *, cost: bool = False
+    ) -> None:
+        statistic_id = reading.statistic_id
+        if cost:
+            statistic_id = (
+                f"sacp:{reading.building_id}_{reading.kind}_cost_{reading.meter_id}"
+            )
+            unit, unit_class = "CNY", None
+        elif reading.kind == "electricity":
+            unit, unit_class = "kWh", "energy"
+        else:
+            unit, unit_class = "m³", "volume"
         await self.command(
             "recorder/import_statistics",
             metadata={
-                "statistic_id": reading.statistic_id,
+                "statistic_id": statistic_id,
                 "source": "sacp",
                 "name": (
                     f"SACP {reading.building_id} "
-                    f"{reading.kind.replace('_', ' ').title()} (Daily) "
+                    f"{reading.kind.replace('_', ' ').title()}"
+                    f"{' Cost' if cost else ''} (Daily) "
                     f"[{reading.meter_id}]"
                 ),
-                "unit_of_measurement": "kWh" if electricity else "m³",
-                "unit_class": "energy" if electricity else "volume",
+                "unit_of_measurement": unit,
+                "unit_class": unit_class,
                 "mean_type": 0,
                 "has_sum": True,
             },
             stats=rows,
         )
+        await self._wait_for_import(statistic_id, rows)
+
+    async def _wait_for_import(
+        self, statistic_id: str, rows: list[dict[str, Any]]
+    ) -> None:
         # Import success means queued, not committed. Read back before dropping
         # pending readings, so reconnecting cannot double-count or lose progress.
         expected = {
             int(datetime.fromisoformat(row["start"]).timestamp() * 1000): row
             for row in rows
         }
+        end_time = (
+            datetime.fromisoformat(rows[-1]["start"]) + timedelta(hours=1)
+        ).isoformat()
         async with asyncio.timeout(30):
             while True:
                 stored = await self.statistics(
-                    [reading.statistic_id],
+                    [statistic_id],
                     start_time=rows[0]["start"],
-                    end_time=(
-                        datetime.fromisoformat(rows[-1]["start"]) + timedelta(hours=1)
-                    ).isoformat(),
+                    end_time=end_time,
                 )
-                actual = {
-                    row["start"]: row for row in stored.get(reading.statistic_id, [])
-                }
+                actual = {row["start"]: row for row in stored.get(statistic_id, [])}
                 if all(
-                    time in actual
-                    and all(
-                        actual[time].get(key) is not None
-                        and math.isclose(actual[time][key], row[key], abs_tol=1e-8)
-                        for key in ("state", "sum")
+                    timestamp in actual
+                    and actual[timestamp].get(key) is not None
+                    and math.isclose(
+                        actual[timestamp][key], row[key], rel_tol=0, abs_tol=1e-8
                     )
-                    for time, row in expected.items()
+                    for timestamp, row in expected.items()
+                    for key in ("state", "sum")
                 ):
                     return
                 await asyncio.sleep(0.25)
 
 
 class HistoryWriter:
-    def __init__(self, url: str, token: str):
+    """Buffer readings in memory and resume from HA's stored statistics."""
+
+    def __init__(
+        self, url: str, token: str, prices: dict[str, Decimal] | None = None
+    ) -> None:
         self.url = websocket_url(url)
         self.token = token
+        self.prices = prices or {}
         self.pending: dict[tuple[str, datetime], Reading] = {}
         self.changed = asyncio.Event()
 
-    def submit(self, readings: tuple[Reading, ...]):
+    def submit(self, readings: tuple[Reading, ...]) -> None:
         for reading in readings:
             local_time = reading.read_at.astimezone(TIMEZONE)
             if (
@@ -210,13 +265,13 @@ class HistoryWriter:
                 continue
             key = reading.statistic_id, reading.read_at
             self.pending[key] = reading
-            while len(self.pending) > MAX_PENDING:
+            if len(self.pending) > MAX_PENDING:
                 del self.pending[next(iter(self.pending))]
                 logger.warning("HA retry buffer full; discarded oldest pending reading")
         if self.pending:
             self.changed.set()
 
-    async def sync(self):
+    async def sync(self) -> None:
         batch = sorted(
             self.pending.values(), key=lambda item: (item.statistic_id, item.read_at)
         )
@@ -231,26 +286,36 @@ class HistoryWriter:
         ) as socket:
             ha = HAConnection(socket)
             await ha.authenticate(self.token)
-            ids = sorted({reading.statistic_id for reading in batch})
+            statistic_ids = sorted({reading.statistic_id for reading in batch})
             # Daily rows are sparse. Reading the full series also recovers an old
             # baseline after a prolonged outage without any local checkpoint.
-            existing = await ha.statistics(ids, start_time="1970-01-01T00:00:00+00:00")
+            existing = await ha.statistics(
+                statistic_ids, start_time="1970-01-01T00:00:00+00:00"
+            )
             for statistic_id, group in groupby(
                 batch, key=lambda item: item.statistic_id
             ):
                 readings = list(group)
                 rows = plan_statistics(readings, existing.get(statistic_id, []))
                 if rows:
-                    await ha.import_statistics(readings[-1], rows)
+                    reading = readings[-1]
+                    price = self.prices.get(reading.kind)
+                    if price is not None:
+                        costs = plan_cost_statistics(rows, price)
+                        # Commit costs first: if either import fails, the usage
+                        # records still select this batch for an idempotent retry.
+                        await ha.import_statistics(reading, costs, cost=True)
+                    await ha.import_statistics(reading, rows)
                     logger.info(
                         "Backfilled %s: %s daily readings", statistic_id, len(rows)
                     )
                 for reading in readings:
                     key = reading.statistic_id, reading.read_at
+                    # Keep any replacement received while imports were awaiting HA.
                     if self.pending.get(key) == reading:
                         del self.pending[key]
 
-    async def run(self):
+    async def run(self) -> None:
         while True:
             await self.changed.wait()
             self.changed.clear()
