@@ -1,9 +1,37 @@
 import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
 HOST = "sacp.szhzzd.top"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+TIMEZONE = ZoneInfo("Asia/Shanghai")
+METER_KINDS = {1: "electricity", 2: "cold_water", 3: "hot_water"}
+
+
+@dataclass(frozen=True)
+class Reading:
+    building_id: int
+    kind: str
+    meter_id: int
+    value: int | float
+    read_at: datetime
+
+    @property
+    def statistic_id(self) -> str:
+        # A replacement meter must never be compared with the previous meter.
+        return f"sacp:{self.building_id}_{self.kind}_{self.meter_id}"
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    building_id: int
+    values: dict[str, int | float | str]
+    readings: tuple[Reading, ...]
+
 
 HEADERS = {
     "invitationUserId": "-1",
@@ -21,7 +49,7 @@ HEADERS = {
 
 async def fetch(
     client: httpx.AsyncClient, access_token: str, building_id: int
-) -> dict[str, int | float]:
+) -> Snapshot:
     response = await client.get(
         f"https://{HOST}/sacp/api/tenant/hs/listingsRoom/getRoomInfo",
         params={"buildingId": building_id},
@@ -38,7 +66,7 @@ async def fetch(
     electricity = _meter(meters, 1)
     cold_water = _meter(meters, 2)
     hot_water = _meter(meters, 3)
-    values = {
+    values: dict[str, int | float | str] = {
         "balance": result["totalBalance"],
         "electricity_meter": electricity["dataItemValue"],
         "cold_water_meter": cold_water["dataItemValue"],
@@ -52,21 +80,38 @@ async def fetch(
         "monthly_total_cost": result["monthTotalBill"],
     }
     for field, value in values.items():
-        if type(value) not in (int, float) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
             raise ValueError(f"upstream field {field} must be a finite number")
-    return values
+    readings = []
+    for energy, kind in METER_KINDS.items():
+        meter = _meter(meters, energy)
+        meter_id = meter["meterId"]
+        if type(meter_id) is not int or meter_id < 0:
+            raise ValueError("invalid meterId")
+        read_at = datetime.strptime(
+            meter["dataItemValueTime"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=TIMEZONE)
+        values[f"{kind}_read_at"] = read_at.isoformat()
+        readings.append(
+            Reading(building_id, kind, meter_id, meter["dataItemValue"], read_at)
+        )
+    return Snapshot(building_id, values, tuple(readings))
 
 
-def _meter(meters: list[dict], energy: int) -> dict:
+def _meter(meters: list[dict[str, Any]], energy: int) -> dict[str, Any]:
     for meter in meters:
         if type(meter["energy"]) is int and meter["energy"] == energy:
             return meter
     raise ValueError(f"upstream response is missing energy {energy} meter")
 
 
-def discovery(building_id: int, mqtt_prefix: str) -> dict:
+def discovery(building_id: int, mqtt_prefix: str) -> dict[str, Any]:
     device_id = f"sacp_{building_id}"
-    components = {}
+    components: dict[str, dict[str, Any]] = {}
     for field, name, unit, device_class in (
         ("balance", "Balance", "CNY", "monetary"),
         ("electricity_meter", "Electricity Meter", "kWh", "energy"),
@@ -80,7 +125,7 @@ def discovery(building_id: int, mqtt_prefix: str) -> dict:
         ("monthly_hot_water_cost", "Monthly Hot Water Cost", "CNY", "monetary"),
         ("monthly_total_cost", "Monthly Total Cost", "CNY", "monetary"),
     ):
-        sensor = {
+        sensor: dict[str, Any] = {
             "platform": "sensor",
             "name": name,
             "unique_id": f"{device_id}_{field}",
@@ -91,6 +136,16 @@ def discovery(building_id: int, mqtt_prefix: str) -> dict:
         if device_class != "monetary":
             sensor["state_class"] = "total_increasing"
         components[field] = sensor
+    for kind in METER_KINDS.values():
+        field = f"{kind}_read_at"
+        components[field] = {
+            "platform": "sensor",
+            "name": f"{kind.replace('_', ' ').title()} Reading Time",
+            "unique_id": f"{device_id}_{field}",
+            "device_class": "timestamp",
+            "entity_category": "diagnostic",
+            "value_template": f"{{{{ value_json.{field} }}}}",
+        }
     return {
         "device": {
             "identifiers": [device_id],
