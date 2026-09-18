@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 
 import aiomqtt
 import httpx
@@ -10,6 +11,10 @@ from .history import HistoryWriter, websocket_url
 from .stats import HOST, Snapshot, discovery, fetch
 
 logger = logging.getLogger(__name__)
+
+
+def _ha_token() -> str:
+    return ctx.options.sacp_ha_token or os.environ.get("SACP_HA_TOKEN", "")
 
 
 class Sacp:
@@ -43,14 +48,20 @@ class Sacp:
             ),
             ("interval", int, 3600, "Query and publish interval in seconds."),
             ("url", str, "", "Home Assistant base URL; omit to disable history sync."),
-            ("token", str, "", "Home Assistant administrator long-lived access token."),
+            (
+                "token",
+                str,
+                "",
+                "Home Assistant administrator long-lived access token; "
+                "defaults to the SACP_HA_TOKEN environment variable.",
+            ),
         ):
             loader.add_option(f"sacp_ha_{name}", kind, default, help_text)
 
     def configure(self, updated: set[str]):
-        if bool(ctx.options.sacp_ha_url) != bool(ctx.options.sacp_ha_token):
+        if bool(ctx.options.sacp_ha_url) != bool(_ha_token()):
             raise exceptions.OptionsError(
-                "sacp_ha_url and sacp_ha_token must be set together"
+                "sacp_ha_url and sacp_ha_token (or SACP_HA_TOKEN) must be set together"
             )
         if ctx.options.sacp_ha_url:
             try:
@@ -117,7 +128,7 @@ class Sacp:
 
     async def run(self):
         history = (
-            HistoryWriter(ctx.options.sacp_ha_url, ctx.options.sacp_ha_token)
+            HistoryWriter(ctx.options.sacp_ha_url, _ha_token())
             if ctx.options.sacp_ha_url
             else None
         )
@@ -162,7 +173,7 @@ class Sacp:
             self._credentials_changed.clear()
             token, building_id = self.access_token, self.building_id
             if token is None or building_id is None:
-                logger.error("Waiting to capture X-Access-Token and buildingId")
+                logger.warning("Waiting to capture X-Access-Token and buildingId")
             else:
                 try:
                     async with asyncio.timeout(30):
