@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import suppress
 from decimal import Decimal
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import aiomqtt
 import httpx
@@ -37,6 +40,7 @@ class Sacp:
     def __init__(self) -> None:
         self.access_token: str | None = None
         self.building_id: int | None = None
+        self._credentials_path: Path | None = None
         self._credentials_changed = asyncio.Event()
         self._state_changed = asyncio.Event()
         self._snapshot: Snapshot | None = None
@@ -113,6 +117,12 @@ class Sacp:
             self.running()
 
     def running(self) -> None:
+        if self._credentials_path is None:
+            self._credentials_path = (
+                Path(ctx.options.confdir).expanduser().absolute()
+                / "sacp-credentials.json"
+            )
+            self._load_credentials(self._credentials_path)
         self._running = True
         if ctx.options.sacp_ha_mqtt_host or ctx.options.sacp_ha_url:
             self.task = asyncio.create_task(self.run())
@@ -132,8 +142,8 @@ class Sacp:
         ):
             return
         previous_credentials = self.access_token, self.building_id
-        if "X-Access-Token" in request.headers:
-            self.access_token = request.headers["X-Access-Token"]
+        if token := request.headers.get("X-Access-Token"):
+            self.access_token = token
             logger.info("Captured X-Access-Token")
         if "buildingId" in request.query:
             try:
@@ -150,7 +160,58 @@ class Sacp:
             and self.building_id is not None
             and (self.access_token, self.building_id) != previous_credentials
         ):
+            self._save_credentials()
             self._credentials_changed.set()
+
+    def _load_credentials(self, path: Path) -> None:
+        try:
+            credentials = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(credentials, dict):
+                raise ValueError
+            token = credentials.get("access_token")
+            building_id = credentials.get("building_id")
+            if (
+                not isinstance(token, str)
+                or not token
+                or type(building_id) is not int
+                or building_id < 0
+            ):
+                raise ValueError
+            self.access_token, self.building_id = token, building_id
+            logger.info("Restored SACP credentials")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            logger.warning("Could not load SACP credentials (%s)", type(error).__name__)
+
+    def _save_credentials(self) -> None:
+        if self._credentials_path is None:
+            return
+        temporary_path = None
+        try:
+            self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            # NamedTemporaryFile creates the file with permissions 0600.
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._credentials_path.parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump(
+                    {
+                        "access_token": self.access_token,
+                        "building_id": self.building_id,
+                    },
+                    temporary,
+                )
+            temporary_path.replace(self._credentials_path)
+        except OSError as error:
+            logger.warning("Could not save SACP credentials (%s)", type(error).__name__)
+        finally:
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
 
     async def run(self) -> None:
         history = (
