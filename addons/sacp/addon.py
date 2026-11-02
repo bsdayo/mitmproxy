@@ -86,6 +86,7 @@ class Sacp:
                 f"Fixed {kind} price in CNY/{unit}; omit to disable cost history. "
                 "Applies only to usage records written in the current batch.",
             )
+        logger.info("SACP addon loaded")
 
     def configure(self, updated: set[str]) -> None:
         _ha_prices()
@@ -178,7 +179,7 @@ class Sacp:
             ):
                 raise ValueError
             self.access_token, self.building_id = token, building_id
-            logger.info("Restored SACP credentials")
+            logger.info("Loaded SACP credentials from %s", path)
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as error:
@@ -206,6 +207,7 @@ class Sacp:
                     temporary,
                 )
             temporary_path.replace(self._credentials_path)
+            logger.info("Saved SACP credentials to %s", self._credentials_path)
         except OSError as error:
             logger.warning("Could not save SACP credentials (%s)", type(error).__name__)
         finally:
